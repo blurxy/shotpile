@@ -136,4 +136,15 @@ the exported image, in your Omarchy theme's colours, not in the tray.)
 
 ## License
 
-[AGPL-3.0](LICENSE)
+[AGPL-3.0](LICENSE). You may use, study, change and share shotpile; if you
+distribute it, or a changed version, or run a changed version as a network
+service, you must publish your source under the same license.
+
+**Commercial license.** If you want to use shotpile in a product without the
+AGPL's obligations (for example, a closed-source version), a commercial license
+is available from the author: open an issue or contact
+[@blurxy](https://github.com/blurxy).
+
+**Contributions.** So that shotpile can stay dual-licensed, contributions are
+accepted on the understanding that the author may also release them under the
+commercial license. Say so in your pull request if you do not agree.
