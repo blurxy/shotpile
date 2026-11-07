@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""shotpile: take several screenshots in a row, then choose how to copy or save the pile.
+
+Usage:
+  shotpile [shot]   take a screenshot; while the tray is open, add another
+  shotpile done     open the copy / save panel
+  shotpile close    close the tray
+
+Capture goes through Omarchy's own `omarchy-capture-screenshot ... save`, so the
+region picker, screen freeze and output folder are exactly the ones a normal
+screenshot uses. Every shot is saved there the moment it is taken, and the newest
+one is on the clipboard, as with a normal screenshot: closing the tray loses
+nothing.
+"""
+
+import math
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+APP_ID = "io.github.blurxy.shotpile"
+OBJECT_PATH = "/" + APP_ID.replace(".", "/")
+
+
+def capture_command():
+    return ["omarchy-capture-screenshot", os.environ.get("SHOTPILE_MODE", "smart"), "save"]
+
+
+# ---- fast path ----------------------------------------------------------------
+# Loading GTK and libadwaita takes ~300 ms, which would sit between the key press
+# and the region picker. So the first shot starts its picker before anything
+# heavy loads, and a press while a tray is open reaches it over D-Bus (~100 ms,
+# was ~450). Measured on the power-saver profile: Omarchy's own picker appears
+# in 320-360 ms, shotpile's in ~380-410. (A 168 ms figure for Omarchy was taken
+# while the CPU was boosted; compare the two under the same profile.)
+
+
+def find_layer_shell():
+    # Checked by path first: `import ctypes.util` alone costs ~56 ms here.
+    for directory in ("/usr/lib", "/usr/lib64", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu"):
+        candidate = os.path.join(directory, "libgtk4-layer-shell.so.0")
+        if os.path.exists(candidate):
+            return candidate
+    import ctypes.util
+    return ctypes.util.find_library("gtk4-layer-shell")
+
+
+def forward_to_open_tray(command):
+    """If a shotpile tray is running, hand it the command and exit."""
+    try:
+        owned = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+             "--object-path", "/org/freedesktop/DBus",
+             "--method", "org.freedesktop.DBus.NameHasOwner", APP_ID],
+            capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return  # no gdbus: GApplication's own remote path still works, just slower
+    if "true" in owned:
+        subprocess.run(
+            ["gdbus", "call", "--session", "--dest", APP_ID, "--object-path", OBJECT_PATH,
+             "--method", "org.gtk.Actions.Activate", command, "[]", "{}"],
+            capture_output=True, timeout=2)
+        sys.exit(0)
+
+
+def start_first_capture():
+    """Start the picker now. Its output pipe is left inheritable so it survives
+    the re-exec below; the child keeps running as ours (exec keeps the PID)."""
+    read_fd, write_fd = os.pipe()
+    child = subprocess.Popen(capture_command(), stdout=write_fd, stderr=subprocess.DEVNULL)
+    os.close(write_fd)
+    os.set_inheritable(read_fd, True)
+    os.environ["SHOTPILE_CAPTURE"] = f"{read_fd}:{child.pid}"
+
+
+def preload_layer_shell():
+    """gtk4-layer-shell must be loaded before libwayland-client. A Python process
+    can only arrange that by restarting itself with the library in LD_PRELOAD."""
+    library = find_layer_shell()
+    if not library:
+        return
+    os.environ["SHOTPILE_PRELOADED"] = "1"
+    os.environ["LD_PRELOAD"] = " ".join(filter(None, [library, os.environ.get("LD_PRELOAD")]))
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+FIRST_CAPTURE = None  # (read fd, pid) of a picker started before GTK loaded
+
+if __name__ == "__main__":
+    COMMAND = sys.argv[1] if len(sys.argv) > 1 else "shot"
+    if COMMAND not in ("shot", "done", "close"):
+        sys.exit(f"usage: shotpile [shot|done|close]  (got {COMMAND!r})")
+    if not os.environ.get("SHOTPILE_PRELOADED"):
+        forward_to_open_tray(COMMAND)
+        if COMMAND != "shot":
+            sys.exit(0)  # no tray open: nothing to finish or close
+        start_first_capture()
+        preload_layer_shell()
+    # Only this process needs these; magick, wl-copy and the capture script don't.
+    os.environ.pop("LD_PRELOAD", None)
+    os.environ.pop("SHOTPILE_PRELOADED", None)
+    if os.environ.get("SHOTPILE_CAPTURE"):
+        fd, pid = os.environ.pop("SHOTPILE_CAPTURE").split(":")
+        FIRST_CAPTURE = (int(fd), int(pid))
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Pango", "1.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+except (ValueError, ImportError):
+    LayerShell = None
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "shotpile"
+RUN_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "shotpile"
+LAST_DIR_FILE = STATE_DIR / "last-dir"
+
+FORMATS = [("png", "PNG"), ("jpg", "JPEG"), ("webp", "WebP"), ("avif", "AVIF"), ("jxl", "JXL")]
+LAYOUTS = [("vertical", "Stacked"), ("horizontal", "Side by side"), ("grid", "Grid")]
+QUALITY = {"jpg": "92", "webp": "92", "avif": "80", "jxl": "90"}
+GAP = 10  # px between stitched shots
+SINGLE_SHOT_SECONDS = 5  # a lone shot's tray closes by itself; a pile waits for you
+
+
+# ---- image work (pure; runs off the UI thread) ------------------------------
+
+
+def magick_output_args(ext):
+    args = []
+    if ext == "jpg":  # no alpha in JPEG: flatten onto white, not black
+        args += ["-background", "white", "-alpha", "remove", "-alpha", "off"]
+    if ext in QUALITY:
+        args += ["-quality", QUALITY[ext]]
+    return args
+
+
+def run_magick(args):
+    subprocess.run(["magick", *args], check=True, capture_output=True)
+
+
+def unique_path(path):
+    if not path.exists():
+        return path
+    for n in range(2, 1000):
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(path)
+
+
+def convert(src, out):
+    """Write src to out in out's format. A PNG-to-PNG 'conversion' is a copy."""
+    if src.suffix.lower() == out.suffix.lower() == ".png":
+        shutil.copy2(src, out)
+    else:
+        run_magick([str(src), *magick_output_args(out.suffix[1:]), str(out)])
+    return out
+
+
+def stitch(shots, layout, out):
+    ext = out.suffix[1:]
+    background = "white" if ext == "jpg" else "none"
+    files = [str(s) for s in shots]
+    if layout == "grid":
+        cols = math.ceil(math.sqrt(len(files)))
+        args = ["montage", *files, "-tile", f"{cols}x", "-geometry", f"+{GAP}+{GAP}", "-background", background]
+    else:
+        args = [*files, "-bordercolor", background, "-border", str(GAP // 2),
+                "-background", background, "-gravity", "center",
+                "-append" if layout == "vertical" else "+append"]
+    run_magick([*args, *magick_output_args(ext), str(out)])
+    return out
+
+
+def read_inherited_capture(fd, pid):
+    """Output of the picker started before the re-exec: read its pipe, reap it."""
+    with os.fdopen(fd, "rb") as pipe:
+        out = pipe.read()
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    return out.decode(errors="replace")
+
+
+def pretty_dir(path):
+    home = str(Path.home())
+    text = str(path)
+    return "~" + text[len(home):] if text.startswith(home) else text
+
+
+# ---- the app -----------------------------------------------------------------
+
+# SPORE's palette (github.com/blurxy/spore, src/ui/mycelium.js). Every colour is a
+# state, not a decoration: two live hues, everything else desaturated.
+#   substrate #06080c  ground
+#   core      #0adcc8  established: the pile, the default action
+#   tip       #ff3ce6  the growing edge: the newest shot, and nothing else
+#   dormant   #26363c  present but idle: edges, resting controls
+#   dim       #546a70  wayfinding: labels, hints
+#   text      #bed6d8  primary text, never pure white
+#   alarm     #ff5c5c  used once, for a failure
+# No glows or gradients; depth comes from value and a 1px edge.
+CSS = """
+window.shotpile { background: none; }
+.sp-card, .sp-card * { font-family: "JetBrainsMono Nerd Font", monospace; }
+.sp-card {
+  background-color: #06080c;
+  border-radius: 8px;
+  border: 1px solid rgba(10, 220, 200, 0.18);
+  padding: 14px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+  color: #bed6d8;
+}
+.title { font-size: 12pt; color: #bed6d8; letter-spacing: 0.02em; }
+.mark { color: #26363c; }
+.count { background-color: rgba(10, 220, 200, 0.10); color: #0adcc8; border-radius: 999px; padding: 0 9px; font-weight: 500; }
+scrolledwindow.thumb { background-color: #06080c; border: 1px solid #26363c; border-radius: 4px; }
+scrolledwindow.thumb.newest { border-color: #ff3ce6; animation: arrive 140ms ease-out; }
+@keyframes arrive { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+.num { background-color: rgba(6, 8, 12, 0.85); color: #0adcc8; border-radius: 999px; padding: 0 6px; margin: 4px; font-size: 9pt; }
+.num.newest { color: #ff3ce6; }
+button.remove { min-width: 20px; min-height: 20px; padding: 0; margin: 3px; border-radius: 999px;
+                background-color: rgba(6, 8, 12, 0.85); color: #546a70; box-shadow: none; }
+button.remove:hover { color: #bed6d8; }
+.hint { color: #546a70; font-size: 9pt; }
+.section { color: #546a70; font-size: 9pt; margin-top: 6px; }
+.rule { color: #26363c; margin-top: 2px; }
+.sp-card button.sp { background: none; border: 1px solid #26363c; border-radius: 6px; color: #bed6d8;
+                     box-shadow: none; padding: 5px 12px; }
+.sp-card button.sp:hover { border-color: #546a70; }
+.sp-card button.sp.accent { background-color: rgba(10, 220, 200, 0.08); border-color: #0adcc8; color: #0adcc8; }
+.sp-card button.sp:disabled { color: #26363c; border-color: #26363c; }
+.sp-card button.close { color: #546a70; background: none; box-shadow: none; min-width: 24px; min-height: 24px; padding: 0; }
+.sp-toggles button { background: none; border: 1px solid #26363c; color: #546a70; box-shadow: none;
+                     padding: 3px 10px; min-height: 0; }
+.sp-toggles button:checked { background-color: rgba(10, 220, 200, 0.08); border-color: rgba(10, 220, 200, 0.55); color: #0adcc8; }
+.dest { color: #546a70; font-size: 9pt; }
+.status { color: #0adcc8; font-size: 9pt; }
+.status.error { color: #ff5c5c; }
+"""
+
+
+class Shotpile(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.shots = []
+        self.capturing = False
+        self.window = None
+        self.panel_open = False
+        self.busy = False
+        self.format = "png"
+        self.layout = "vertical"
+        self.dest_dir = self.load_last_dir()
+        self.countdown = 0
+        self.countdown_id = 0
+        self.hovered = False
+        self.owning_clipboard = False
+        self.clipboard = None
+        self.first_capture = FIRST_CAPTURE
+
+    # -- lifecycle ------------------------------------------------------------
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # The clipboard outlives the tray: after a copy this process keeps
+        # serving the paste until something else is copied.
+        self.clipboard = Gdk.Display.get_default().get_clipboard()
+        self.clipboard.connect("changed", self.on_clipboard_changed)
+        # A key press while the tray is open arrives as one of these actions,
+        # over D-Bus (see forward_to_open_tray), without a second GTK process.
+        for name, handler in (("shot", self.shoot), ("done", self.finish), ("close", self.close_tray)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda _action, _param, run=handler: run())
+            self.add_action(action)
+
+    def do_command_line(self, command_line):
+        args = command_line.get_arguments()[1:]
+        command = args[0] if args else "shot"
+        if command == "shot":
+            if self.first_capture and not self.capturing:
+                fd, pid = self.first_capture  # already picking: started before GTK loaded
+                self.first_capture = None
+                self.await_capture(lambda: read_inherited_capture(fd, pid))
+            else:
+                self.shoot()
+        elif command == "done":
+            self.finish()
+        elif command == "close":
+            self.close_tray()
+        else:
+            return 2
+        return 0
+
+    def finish(self):
+        if self.shots:
+            self.open_panel()
+
+    # -- capture --------------------------------------------------------------
+
+    def shoot(self):
+        if self.capturing:
+            # Like Omarchy's own screenshot key: pressing it again mid-pick cancels.
+            subprocess.run(["pkill", "-x", "slurp"])
+            return
+        self.stop_countdown()
+        if self.window and self.window.get_visible():
+            self.window.set_visible(False)
+            # A couple of frames for the compositor to drop the tray before the
+            # screen freezes, or the tray ends up in the shot.
+            GLib.timeout_add(80, self.start_capture)
+        else:
+            self.start_capture()
+
+    def start_capture(self):
+        try:
+            proc = subprocess.Popen(capture_command(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError as error:
+            self.show_tray(f"capture failed: {error.strerror}", error=True)
+            return GLib.SOURCE_REMOVE
+        self.await_capture(lambda: proc.communicate()[0].decode(errors="replace"))
+        return GLib.SOURCE_REMOVE
+
+    def await_capture(self, wait):
+        """wait() blocks until the picker finishes and returns what it printed."""
+        self.capturing = True
+        self.hold()
+
+        def run():
+            GLib.idle_add(self.on_captured, wait())
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_captured(self, out):
+        self.capturing = False
+        lines = [line.strip() for line in (out or "").splitlines() if line.strip()]
+        path = lines[-1] if lines else ""
+        if path and os.path.isfile(path):
+            self.shots.append(Path(path))
+            # Same as a normal screenshot: the newest shot is on the clipboard.
+            with open(path, "rb") as image:
+                subprocess.Popen(["wl-copy", "--type", "image/png"], stdin=image)
+            if self.dest_dir is None:
+                self.dest_dir = Path(path).parent
+        if self.shots:
+            self.show_tray()
+        self.release()
+
+    # -- tray -----------------------------------------------------------------
+
+    def build_window(self):
+        win = Gtk.ApplicationWindow(application=self, title="shotpile", resizable=False)
+        win.add_css_class("shotpile")
+        if LayerShell and LayerShell.is_supported():
+            LayerShell.init_for_window(win)
+            LayerShell.set_namespace(win, "shotpile")
+            LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+            for edge in (LayerShell.Edge.BOTTOM, LayerShell.Edge.RIGHT):
+                LayerShell.set_anchor(win, edge, True)
+                LayerShell.set_margin(win, edge, 24)
+            # Focus only when clicked, so capturing never steals your keyboard.
+            LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.ON_DEMAND)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        win.add_controller(keys)
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", lambda *_: self.set_hovered(True))
+        hover.connect("leave", lambda *_: self.set_hovered(False))
+        win.add_controller(hover)
+        win.connect("close-request", self.on_close_request)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        card.add_css_class("sp-card")
+
+        header = Gtk.Box(spacing=8)
+        title = Gtk.Label(label="shotpile")
+        title.add_css_class("title")
+        mark = Gtk.Label(label="⟐")
+        mark.add_css_class("mark")
+        self.count_label = Gtk.Label(valign=Gtk.Align.CENTER)
+        self.count_label.add_css_class("count")
+        close = Gtk.Button(label="×", tooltip_text="close (esc)")
+        close.add_css_class("close")
+        close.connect("clicked", lambda *_: self.close_tray())
+        header.append(title)
+        header.append(mark)
+        header.append(self.count_label)
+        header.append(Gtk.Box(hexpand=True))
+        header.append(close)
+
+        self.strip = Gtk.Box(spacing=8)
+        scroller = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC, vscrollbar_policy=Gtk.PolicyType.NEVER,
+            propagate_natural_width=True, propagate_natural_height=True,
+            max_content_width=580, child=self.strip)
+
+        self.hint = Gtk.Label(xalign=0, wrap=True, max_width_chars=52)
+        self.hint.add_css_class("hint")
+
+        actions = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        add = self.button("+ add another", lambda: self.shoot(), "or press super+shift+2")
+        self.done_button = self.button("done", self.toggle_panel)
+        self.done_button.add_css_class("accent")  # the tray's one default action
+        actions.append(add)
+        actions.append(self.done_button)
+
+        # Hidden, not collapsed: a collapsed panel would still set the tray's width.
+        self.panel = self.build_panel()
+        self.panel.set_visible(False)
+
+        for child in (header, scroller, self.hint, actions, self.panel):
+            card.append(child)
+        win.set_child(Adw.Clamp(maximum_size=620, tightening_threshold=620, child=card))
+        return win
+
+    def build_panel(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        rule = Gtk.Label(label="⊰-•-•⟐•-•-⊱")
+        rule.add_css_class("rule")
+        box.append(rule)
+
+        box.append(self.section("format"))
+        box.append(self.toggle_group(FORMATS, self.format, "format"))
+        box.append(self.section("stitch"))
+        box.append(self.toggle_group(LAYOUTS, self.layout, "layout"))
+
+        # Copy and save are both commit actions, so they look alike. The accent
+        # marks one of them: the default at first, then whichever you last used.
+        copy_all = self.button(
+            "copy all", lambda: self.act(copy_all, "copying…", self.job_copy_all),
+            "paste them all at once: as files in file managers and chat apps, "
+            "as one stitched image where only an image is accepted")
+        copy_one = self.button("copy as one image", lambda: self.act(copy_one, "stitching…", self.job_copy_stitched))
+        save_all = self.button("save all", lambda: self.act(save_all, "saving…", self.job_save_all))
+        save_one = self.button("save as one image", lambda: self.act(save_one, "stitching…", self.job_save_stitched))
+
+        for label, pair in (("copy", (copy_all, copy_one)), ("save", (save_all, save_one))):
+            box.append(self.section(label))
+            row = Gtk.Box(spacing=8, homogeneous=True)
+            for button in pair:
+                row.append(button)
+            box.append(row)
+
+        dest_row = Gtk.Box(spacing=8)
+        self.dest_label = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE,
+                                    max_width_chars=36)
+        self.dest_label.add_css_class("dest")
+        change = self.button("change folder…", lambda: self.choose_folder())
+        dest_row.append(self.dest_label)
+        dest_row.append(change)
+        box.append(dest_row)
+
+        self.status = Gtk.Label(xalign=0, wrap=True, max_width_chars=52)
+        self.status.add_css_class("status")
+        box.append(self.status)
+        self.action_buttons = [copy_all, copy_one, save_all, save_one]
+        self.job_buttons = [*self.action_buttons, change]
+        self.set_accent(copy_all)
+        return box
+
+    def button(self, label, handler, tooltip=None):
+        button = Gtk.Button(label=label, tooltip_text=tooltip)
+        button.add_css_class("sp")
+        button.connect("clicked", lambda *_: handler())
+        return button
+
+    def set_accent(self, chosen):
+        for button in self.action_buttons:
+            if button is chosen:
+                button.add_css_class("accent")
+            else:
+                button.remove_css_class("accent")
+
+    def act(self, button, message, job):
+        self.set_accent(button)
+        self.run_job(message, job)
+
+    def section(self, text):
+        label = Gtk.Label(label=f"⟐ {text}", xalign=0)
+        label.add_css_class("section")
+        return label
+
+    def toggle_group(self, options, active, attribute):
+        box = Gtk.Box()
+        box.add_css_class("linked")
+        box.add_css_class("sp-toggles")
+        first = None
+        for name, label in options:
+            toggle = Gtk.ToggleButton(label=label.lower())
+            if first is None:
+                first = toggle
+            else:
+                toggle.set_group(first)
+            toggle.set_active(name == active)
+            toggle.connect("toggled", lambda t, n=name: t.get_active() and setattr(self, attribute, n))
+            box.append(toggle)
+        return box
+
+    def show_tray(self, message=None, error=False):
+        if self.window is None:
+            self.window = self.build_window()
+        self.refresh()
+        if message:
+            self.set_status(message, error)
+        self.window.set_visible(True)
+        self.window.present()
+        if len(self.shots) == 1 and not self.panel_open:
+            self.start_countdown()
+
+    def refresh(self):
+        child = self.strip.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.strip.remove(child)
+            child = nxt
+        for index, path in enumerate(self.shots):
+            self.strip.append(self.thumbnail(index, path))
+        n = len(self.shots)
+        self.count_label.set_label(f"{n} shot" + ("" if n == 1 else "s"))
+        self.dest_label.set_label(f"saves to {pretty_dir(self.dest_dir)}" if self.dest_dir else "")
+        self.update_hint()
+
+    def thumbnail(self, index, path):
+        # A downscaled texture, not the full screenshot: a Picture of a 2560x1600
+        # file asks for 2560x1600 and holds ~16 MB per shot.
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), 360, 360, True)
+        texture = Gdk.MemoryTexture.new(
+            pixbuf.get_width(), pixbuf.get_height(),
+            Gdk.MemoryFormat.R8G8B8A8 if pixbuf.get_has_alpha() else Gdk.MemoryFormat.R8G8B8,
+            pixbuf.read_pixel_bytes(), pixbuf.get_rowstride())
+        picture = Gtk.Picture.new_for_paintable(texture)
+        picture.set_content_fit(Gtk.ContentFit.COVER)
+        picture.set_can_shrink(True)
+        picture.set_tooltip_text(f"{path.name}\nclick to edit")
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: self.edit(path))
+        picture.add_controller(click)
+
+        # A scrolled window that never scrolls: it sizes to its own request
+        # instead of the picture's natural size, and clips the rounded corners.
+        frame = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.EXTERNAL, vscrollbar_policy=Gtk.PolicyType.EXTERNAL,
+            child=picture)
+        frame.set_size_request(150, 94)
+        frame.set_overflow(Gtk.Overflow.HIDDEN)
+        frame.add_css_class("thumb")
+
+        overlay = Gtk.Overlay(child=frame)
+        number = Gtk.Label(label=str(index + 1), halign=Gtk.Align.START, valign=Gtk.Align.START)
+        number.add_css_class("num")
+        # The newest shot is the growing edge: the only magenta on screen.
+        if index == len(self.shots) - 1 and len(self.shots) > 1:
+            frame.add_css_class("newest")
+            number.add_css_class("newest")
+        remove = Gtk.Button(label="×", halign=Gtk.Align.END,
+                            valign=Gtk.Align.START, tooltip_text="leave out of the pile (the file stays)")
+        remove.add_css_class("remove")
+        remove.connect("clicked", lambda *_: self.drop(index))
+        overlay.add_overlay(number)
+        overlay.add_overlay(remove)
+        return overlay
+
+    def update_hint(self):
+        if self.panel_open:
+            self.hint.set_label("super+shift+2 still adds shots")
+        elif len(self.shots) == 1 and self.countdown_id:
+            self.hint.set_label(f"saved • copied • super+shift+2 adds another • closes in {self.countdown}s")
+        else:
+            self.hint.set_label("super+shift+2 adds another • done when you're finished")
+
+    def drop(self, index):
+        if 0 <= index < len(self.shots):
+            del self.shots[index]
+        if self.shots:
+            self.refresh()
+        else:
+            self.close_tray()
+
+    def edit(self, path):
+        editor = os.environ.get("OMARCHY_SCREENSHOT_EDITOR", "tensaku-edit")
+        try:
+            subprocess.Popen([editor, str(path)])
+        except OSError as error:
+            self.set_status(f"couldn't open {editor}: {error.strerror}", error=True)
+
+    def toggle_panel(self):
+        if self.panel_open:
+            self.panel_open = False
+            self.panel.set_visible(False)
+            self.done_button.set_label("done")
+            self.update_hint()
+        else:
+            self.open_panel()
+
+    def open_panel(self):
+        if self.window is None:
+            self.show_tray()
+        self.stop_countdown()
+        self.panel_open = True
+        self.panel.set_visible(True)
+        self.done_button.set_label("hide")
+        self.update_hint()
+
+    def close_tray(self):
+        self.stop_countdown()
+        if self.window:
+            self.window.destroy()
+            self.window = None
+        self.shots = []
+        self.panel_open = False
+
+    def on_close_request(self, _window):
+        self.close_tray()
+        return True
+
+    def on_key(self, _controller, keyval, _code, _state):
+        if keyval == Gdk.KEY_Escape:
+            if self.panel_open:
+                self.toggle_panel()
+            else:
+                self.close_tray()
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and not self.panel_open:
+            self.open_panel()
+            return True
+        return False
+
+    # A lone shot's tray closes by itself, like a notification; hovering pauses it.
+    def start_countdown(self):
+        self.stop_countdown()
+        self.countdown = SINGLE_SHOT_SECONDS
+        self.countdown_id = GLib.timeout_add_seconds(1, self.tick)
+        self.update_hint()
+
+    def stop_countdown(self):
+        if self.countdown_id:
+            GLib.source_remove(self.countdown_id)
+            self.countdown_id = 0
+
+    def tick(self):
+        if self.hovered:
+            return GLib.SOURCE_CONTINUE
+        self.countdown -= 1
+        if self.countdown <= 0:
+            self.countdown_id = 0
+            self.close_tray()
+            return GLib.SOURCE_REMOVE
+        self.update_hint()
+        return GLib.SOURCE_CONTINUE
+
+    def set_hovered(self, hovered):
+        self.hovered = hovered
+
+    # -- jobs -----------------------------------------------------------------
+
+    def work_dir(self):
+        path = RUN_DIR / time.strftime("%Y%m%d-%H%M%S")
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def run_job(self, message, job):
+        if self.busy or not self.shots:
+            return
+        self.busy = True
+        for button in self.job_buttons:
+            button.set_sensitive(False)
+        self.set_status(message)
+        shots, fmt, layout, dest = list(self.shots), self.format, self.layout, self.dest_dir
+
+        def worker():
+            try:
+                outcome = job(shots, fmt, layout, dest)
+            except subprocess.CalledProcessError as error:
+                detail = (error.stderr or b"").decode(errors="replace").strip().splitlines()
+                outcome = ("error", "imagemagick failed: " + (detail[-1] if detail else str(error)))
+            except OSError as error:
+                outcome = ("error", f"{error.strerror}: {error.filename}")
+            GLib.idle_add(self.job_finished, outcome)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def job_finished(self, outcome):
+        self.busy = False
+        for button in self.job_buttons:
+            button.set_sensitive(True)
+        kind = outcome[0]
+        if kind == "error":
+            self.set_status(outcome[1], error=True)
+        elif kind == "copy":
+            _, files, png, message = outcome
+            self.put_on_clipboard(files, png)
+            self.set_status(message)
+        else:
+            self.set_status(outcome[1])
+        return GLib.SOURCE_REMOVE
+
+    def job_copy_all(self, shots, fmt, layout, _dest):
+        work = self.work_dir()
+        files = shots if fmt == "png" else [convert(s, work / f"{s.stem}.{fmt}") for s in shots]
+        stitched = stitch(shots, layout, work / "stitched.png")
+        n = len(files)
+        return ("copy", files, stitched.read_bytes(),
+                f"copied {n} {fmt} file{'s' if n != 1 else ''} • paste anywhere")
+
+    def job_copy_stitched(self, shots, fmt, layout, _dest):
+        work = self.work_dir()
+        png = stitch(shots, layout, work / "stitched.png")
+        out = png if fmt == "png" else convert(png, work / f"shotpile-{time.strftime('%H%M%S')}.{fmt}")
+        return ("copy", [out], png.read_bytes(), f"copied one stitched {fmt} image")
+
+    def job_save_all(self, shots, fmt, _layout, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+        written = 0
+        for shot in shots:
+            if shot.parent == dest and shot.suffix.lower() == f".{fmt}":
+                continue  # already there, as a screenshot is saved on capture
+            convert(shot, unique_path(dest / f"{shot.stem}.{fmt}"))
+            written += 1
+        self.save_last_dir(dest)
+        if written == 0:
+            return ("ok", f"all {len(shots)} already in {pretty_dir(dest)}")
+        return ("ok", f"saved {written} to {pretty_dir(dest)}")
+
+    def job_save_stitched(self, shots, fmt, layout, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+        out = stitch(shots, layout, unique_path(dest / f"shotpile-{time.strftime('%Y-%m-%d_%H-%M-%S')}.{fmt}"))
+        self.save_last_dir(dest)
+        return ("ok", f"saved {out.name} to {pretty_dir(dest)}")
+
+    # -- clipboard ------------------------------------------------------------
+
+    def put_on_clipboard(self, files, png):
+        """Offer the pile in every form a paste target might want: a file list
+        (chat apps, browsers, GTK apps), GNOME's copied-files (Nautilus), and one
+        stitched PNG for targets that accept only an image. Each app takes the
+        richest one it understands."""
+        uris = [Gio.File.new_for_path(str(f)).get_uri() for f in files]
+        providers = [
+            Gdk.ContentProvider.new_for_bytes(
+                "text/uri-list", GLib.Bytes.new(("\r\n".join(uris) + "\r\n").encode())),
+            Gdk.ContentProvider.new_for_bytes(
+                "x-special/gnome-copied-files", GLib.Bytes.new(("copy\n" + "\n".join(uris)).encode())),
+            Gdk.ContentProvider.new_for_bytes("image/png", GLib.Bytes.new(png)),
+        ]
+        self.clipboard.set_content(Gdk.ContentProvider.new_union(providers))
+        if not self.owning_clipboard:
+            self.owning_clipboard = True
+            self.hold()  # stay alive to serve the paste until something else is copied
+
+    def on_clipboard_changed(self, clipboard):
+        if self.owning_clipboard and not clipboard.get_property("local"):
+            self.owning_clipboard = False
+            self.release()
+
+    # -- folders --------------------------------------------------------------
+
+    def choose_folder(self, *_):
+        dialog = Gtk.FileDialog(title="Save shots to…")
+        if self.dest_dir:
+            dialog.set_initial_folder(Gio.File.new_for_path(str(self.dest_dir)))
+        self.hold()
+        dialog.select_folder(None, None, self.on_folder_chosen)
+
+    def on_folder_chosen(self, dialog, result):
+        self.release()
+        try:
+            folder = dialog.select_folder_finish(result)
+        except GLib.Error:
+            return  # cancelled
+        if folder and folder.get_path():
+            self.dest_dir = Path(folder.get_path())
+            self.save_last_dir(self.dest_dir)
+            if self.window:
+                self.refresh()
+
+    def load_last_dir(self):
+        try:
+            path = Path(LAST_DIR_FILE.read_text().strip())
+            return path if path.is_dir() else None
+        except OSError:
+            return None
+
+    def save_last_dir(self, path):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        LAST_DIR_FILE.write_text(f"{path}\n")
+
+    def set_status(self, text, error=False):
+        if not self.window:
+            return
+        self.status.set_label(text)
+        if error:
+            self.status.add_css_class("error")
+        else:
+            self.status.remove_css_class("error")
+
+
+if __name__ == "__main__":
+    sys.exit(Shotpile().run(sys.argv))
