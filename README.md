@@ -14,14 +14,34 @@ up and the next shot joins the pile. Hit **done** and choose:
   one
 - **format**: PNG, JPEG, WebP, AVIF or JXL
 
+Each shot in the tray also works on its own, the way CleanShot X's quick-access
+card does:
+
+- **drag it** straight into Chrome, a chat app or a file manager
+- **hover it** for copy · edit · pin · text (OCR) · QR · beautify
+  - *edit* opens Omasnap's annotation editor
+  - *pin* floats it above every workspace (`omasnap --pin`)
+  - *text* copies the words in it (tesseract, offline)
+  - *QR* copies a code in it and opens it if it is a link (zbarimg, offline)
+  - *beautify* adds rounded corners, a shadow and a gradient in your Omarchy
+    theme's colours, swaps it into the pile and copies it
+- **keys** (click the tray first): Ctrl+C copies the newest, Ctrl+Shift+C the
+  whole pile, Delete drops the newest, P pins it, T copies its text, Enter
+  opens the panel, Esc closes
+- **+ scrolling** captures a scrolling page into the pile; `shotpile restore`
+  reopens the last pile you closed
+
 Built for [Omarchy](https://omarchy.org) on Hyprland.
 
 ## How it works
 
-- **Capture is Omarchy's.** Every shot runs `omarchy-capture-screenshot … save`,
-  so the region picker, the screen freeze and the output folder are the same as
-  a normal screenshot. Each shot is saved the moment it is taken, and the newest
-  is copied, so closing the tray never loses anything.
+- **Capture is Omarchy's.** Every shot runs Omasnap (`omasnap <mode> --save`),
+  Omarchy's own screenshot tool since 4.5, so the region picker, the screen
+  freeze and the output folder are the same as a normal screenshot. Omasnap
+  prints no path, so shotpile takes the newest image saved since the capture
+  began (Esc saves nothing, so nothing is added). Each shot is saved the moment
+  it is taken, and the newest is copied, so closing the tray never loses
+  anything. Without Omasnap it falls back to `omarchy-capture-screenshot`.
 - **The tray is a GTK4 layer surface** (via gtk4-layer-shell). It floats above
   windows, takes keyboard focus only when you click it, and hides itself while
   you pick a region so it never lands in a shot.
@@ -35,10 +55,10 @@ Built for [Omarchy](https://omarchy.org) on Hyprland.
 
 ## Install
 
-Requirements: Omarchy (for `omarchy-capture-screenshot`), Python 3 with
-PyGObject, GTK 4, libadwaita, ImageMagick 7 (`magick`), wl-clipboard, and
-`gdbus`. gtk4-layer-shell is optional; without it the tray is an ordinary
-window.
+Requirements: Omarchy 4.5+ (for `omasnap`), Python 3 with PyGObject, GTK 4
+(4.8+ for drag and drop), libadwaita, ImageMagick 7 (`magick`), wl-clipboard,
+and `gdbus`. Optional: gtk4-layer-shell (without it the tray is an ordinary
+window), `tesseract` for text, `zbarimg` for QR codes.
 
 ```sh
 git clone https://github.com/blurxy/shotpile ~/shotpile
@@ -52,8 +72,21 @@ o.bind("SUPER + SHIFT + code:11", "Screenshot · again to pile up",
   "command -v shotpile >/dev/null && exec shotpile shot || exec omarchy-capture-screenshot")
 ```
 
-Commands: `shotpile shot` (take one, or add to an open tray), `shotpile done`
-(open the copy/save panel), `shotpile close`.
+Commands: `shotpile shot` (take one, or add to an open tray), `shotpile scroll`
+(a scrolling capture), `shotpile restore` (reopen the last closed pile),
+`shotpile done` (open the copy/save panel), `shotpile close`, and
+`shotpile selftest`.
+
+`shotpile selftest` takes one silent fullscreen shot into a temporary folder
+and checks shotpile can find it. Run it after Omarchy updates: the 4.5 update
+broke shotpile silently by swapping the capture tool. To run it automatically:
+
+```sh
+cat > ~/.config/omarchy/hooks/post-update.d/shotpile-selftest.hook <<'HOOK'
+out=$("$HOME/.local/bin/shotpile" selftest 2>&1) && exit 0
+notify-send -u critical "Screenshot key broke after the Omarchy update" "$out"
+HOOK
+```
 
 ## What it cannot tell you
 
@@ -79,15 +112,27 @@ Each of these was measured on the machine it was built on, not inferred.
    from a boosted CPU. Adding to an open tray takes ~100 ms before its capture
    starts.
 
-5. **It depends on Omarchy's screenshot script.** It is a wrapper, not a
-   standalone capture tool.
+5. **It depends on Omarchy's screenshot tool.** It is a wrapper, not a
+   standalone capture tool, and an Omarchy update can change the contract
+   underneath it (4.5 did). `shotpile selftest` exists to catch that.
+
+6. **Per-shot actions, measured on a 4K screen.** OCR read two test lines
+   exactly in 0.7 s. Beautify takes ~2.8 s on a 3840×2160 shot: shots wider
+   than 2560 px are scaled down to 2560 first (it was ~5 s at full size).
+   A QR code needs its white margin: one cut off at a screen edge or covered
+   by another window won't read.
+
+7. **Scrolling capture is Omasnap's flow.** Drag the region, choose *Auto*,
+   then *Done* when it reports the end; only then does the stitched image join
+   the pile. It scrolls whichever way the page scrolls, sideways included.
 
 ## Style
 
 The palette and rules are [SPORE](https://github.com/blurxy/spore)'s
 (`src/ui/mycelium.js`): every colour is a state. Cyan is the established pile,
 magenta is only ever the newest shot, and everything else is desaturated. No
-glows, no gradients; depth comes from a 1px edge.
+glows, no gradients; depth comes from a 1px edge. (Beautify's gradient is in
+the exported image, in your Omarchy theme's colours, not in the tray.)
 
 ## License
 
