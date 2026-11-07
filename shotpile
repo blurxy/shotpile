@@ -3,10 +3,17 @@
 
 Usage:
   shotpile [shot]   take a screenshot; while the tray is open, add another
+  shotpile scroll   take a scrolling screenshot into the pile
+  shotpile restore  reopen the last pile you closed
   shotpile done     open the copy / save panel
   shotpile close    close the tray
+  shotpile selftest check the capture still works (run after Omarchy updates)
 
-Capture goes through Omarchy's own `omarchy-capture-screenshot ... save`, so the
+Each thumbnail can be dragged into any app, and hovering it shows
+copy / edit / pin / text (OCR) / QR / beautify. Tray keys: Ctrl+C newest,
+Ctrl+Shift+C whole pile, Delete drop newest, P pin, T text, Enter done, Esc close.
+
+Capture goes through Omarchy's Omasnap (`omasnap <mode> --save`), so the
 region picker, screen freeze and output folder are exactly the ones a normal
 screenshot uses. Every shot is saved there the moment it is taken, and the newest
 one is on the clipboard, as with a normal screenshot: closing the tray loses
@@ -26,8 +33,43 @@ APP_ID = "io.github.blurxy.shotpile"
 OBJECT_PATH = "/" + APP_ID.replace(".", "/")
 
 
-def capture_command():
-    return ["omarchy-capture-screenshot", os.environ.get("SHOTPILE_MODE", "smart"), "save"]
+def capture_command(mode=None):
+    # 2026-11-06: Omarchy 4.5 replaced Tensaku with Omasnap. Call omasnap directly:
+    # omarchy-capture-screenshot adds --notify, which would pop a second toast on
+    # top of the tray. Older Omarchy (no omasnap) keeps the old route.
+    mode = mode or os.environ.get("SHOTPILE_MODE", "smart")
+    if shutil.which("omasnap"):
+        return ["omasnap", mode, "--save"]
+    return ["omarchy-capture-screenshot", mode, "save"]
+
+
+def screenshot_dir():
+    for var in ("OMASNAP_SCREENSHOT_DIR", "OMARCHY_SCREENSHOT_DIR"):
+        if os.environ.get(var):
+            return Path(os.path.expanduser(os.environ[var]))
+    try:
+        pictures = subprocess.run(["xdg-user-dir", "PICTURES"], capture_output=True,
+                                  text=True, timeout=2).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pictures = ""
+    return Path(pictures or os.path.expanduser("~/Pictures")) / "Screenshots"
+
+
+def find_capture(out, started):
+    """The file a capture produced. Tensaku printed its path; Omasnap prints
+    nothing, so fall back to the newest image saved since the capture began.
+    Esc/cancel saves nothing, so this correctly returns None then."""
+    lines = [line.strip() for line in (out or "").splitlines() if line.strip()]
+    if lines and os.path.isfile(lines[-1]):
+        return Path(lines[-1])
+    folder = screenshot_dir()
+    try:
+        fresh = [f for f in folder.iterdir()
+                 if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                 and f.stat().st_mtime >= started - 1]
+    except OSError:
+        return None
+    return max(fresh, key=lambda f: f.stat().st_mtime) if fresh else None
 
 
 # ---- fast path ----------------------------------------------------------------
@@ -67,14 +109,14 @@ def forward_to_open_tray(command):
         sys.exit(0)
 
 
-def start_first_capture():
+def start_first_capture(mode=None):
     """Start the picker now. Its output pipe is left inheritable so it survives
     the re-exec below; the child keeps running as ours (exec keeps the PID)."""
     read_fd, write_fd = os.pipe()
-    child = subprocess.Popen(capture_command(), stdout=write_fd, stderr=subprocess.DEVNULL)
+    child = subprocess.Popen(capture_command(mode), stdout=write_fd, stderr=subprocess.DEVNULL)
     os.close(write_fd)
     os.set_inheritable(read_fd, True)
-    os.environ["SHOTPILE_CAPTURE"] = f"{read_fd}:{child.pid}"
+    os.environ["SHOTPILE_CAPTURE"] = f"{read_fd}:{child.pid}:{time.time()}"
 
 
 def preload_layer_shell():
@@ -88,24 +130,57 @@ def preload_layer_shell():
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
+def selftest():
+    """Take one silent fullscreen shot into a temp folder and check shotpile can
+    find it, i.e. the capture contract still holds. Run after Omarchy updates
+    (~/.config/omarchy/hooks/post-update.d/shotpile-selftest.hook): the 4.5
+    update broke it silently on 2026-11-06 (Omasnap prints no path). No GTK."""
+    import tempfile
+    problems = []
+    for tool in ("wl-copy", "omasnap"):
+        if not shutil.which(tool):
+            problems.append(f"{tool} not found")
+    with tempfile.TemporaryDirectory(prefix="shotpile-selftest-") as folder:
+        env = dict(os.environ, SHOTPILE_MODE="fullscreen", OMASNAP_SCREENSHOT_DIR=folder)
+        os.environ.update(SHOTPILE_MODE="fullscreen", OMASNAP_SCREENSHOT_DIR=folder)
+        started = time.time()
+        try:
+            run = subprocess.run(capture_command(), capture_output=True, text=True, timeout=20, env=env)
+            path = find_capture(run.stdout, started)
+            if run.returncode != 0:
+                problems.append(f"{' '.join(capture_command())} exited {run.returncode}: {run.stderr.strip()[:200]}")
+            elif not path:
+                problems.append(f"capture ran but no image appeared in {folder}")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            problems.append(f"capture failed: {error}")
+    if problems:
+        print("shotpile selftest FAILED:\n  " + "\n  ".join(problems))
+        return 1
+    print("shotpile selftest OK")
+    return 0
+
+
 FIRST_CAPTURE = None  # (read fd, pid) of a picker started before GTK loaded
 
 if __name__ == "__main__":
     COMMAND = sys.argv[1] if len(sys.argv) > 1 else "shot"
-    if COMMAND not in ("shot", "done", "close"):
-        sys.exit(f"usage: shotpile [shot|done|close]  (got {COMMAND!r})")
+    if COMMAND == "selftest":
+        sys.exit(selftest())
+    if COMMAND not in ("shot", "scroll", "restore", "done", "close"):
+        sys.exit(f"usage: shotpile [shot|scroll|restore|done|close|selftest]  (got {COMMAND!r})")
     if not os.environ.get("SHOTPILE_PRELOADED"):
         forward_to_open_tray(COMMAND)
-        if COMMAND != "shot":
+        if COMMAND in ("done", "close"):
             sys.exit(0)  # no tray open: nothing to finish or close
-        start_first_capture()
+        if COMMAND in ("shot", "scroll"):
+            start_first_capture("scroll" if COMMAND == "scroll" else None)
         preload_layer_shell()
     # Only this process needs these; magick, wl-copy and the capture script don't.
     os.environ.pop("LD_PRELOAD", None)
     os.environ.pop("SHOTPILE_PRELOADED", None)
     if os.environ.get("SHOTPILE_CAPTURE"):
-        fd, pid = os.environ.pop("SHOTPILE_CAPTURE").split(":")
-        FIRST_CAPTURE = (int(fd), int(pid))
+        fd, pid, started = os.environ.pop("SHOTPILE_CAPTURE").split(":")
+        FIRST_CAPTURE = (int(fd), int(pid), float(started))
 
 import gi  # noqa: E402
 
@@ -114,7 +189,7 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Pango", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 try:
     gi.require_version("Gtk4LayerShell", "1.0")
@@ -125,6 +200,8 @@ except (ValueError, ImportError):
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "shotpile"
 RUN_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "shotpile"
 LAST_DIR_FILE = STATE_DIR / "last-dir"
+LAST_PILE_FILE = STATE_DIR / "last-pile"
+THEME_COLORS = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "omarchy/current/theme/colors.toml"
 
 FORMATS = [("png", "PNG"), ("jpg", "JPEG"), ("webp", "WebP"), ("avif", "AVIF"), ("jxl", "JXL")]
 LAYOUTS = [("vertical", "Stacked"), ("horizontal", "Side by side"), ("grid", "Grid")]
@@ -181,6 +258,87 @@ def stitch(shots, layout, out):
                 "-append" if layout == "vertical" else "+append"]
     run_magick([*args, *magick_output_args(ext), str(out)])
     return out
+
+
+def theme_colors():
+    """Two colours from the current Omarchy theme for Beautify's gradient."""
+    colors = {}
+    try:
+        for line in THEME_COLORS.read_text().splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                colors[key.strip()] = value.strip().strip('"')
+    except OSError:
+        pass
+    return colors.get("accent", "#89a9c2"), colors.get("magenta", "#aea0bd")
+
+
+def image_size(path):
+    out = subprocess.run(["magick", "identify", "-format", "%w %h", f"{path}[0]"],
+                         check=True, capture_output=True, text=True).stdout.split()
+    return int(out[0]), int(out[1])
+
+
+def beautify(src, out):
+    """CleanShot/Shottr-style backdrop: rounded corners, a soft shadow, and the
+    shot centred on a gradient in the current theme's colours."""
+    work = out.with_suffix(".work.png")
+    w, h = image_size(src)
+    if w > 2560:  # a 4K shot took ~5 s; at 2560 wide it is crisp and ~3x faster
+        small = out.with_suffix(".small.png")
+        run_magick([str(src), "-resize", "2560x", str(small)])
+        src, (w, h) = small, image_size(small)
+    radius = max(8, min(w, h) // 60)
+    run_magick([str(src), "-alpha", "set",
+                "(", "-size", f"{w}x{h}", "xc:none", "-fill", "white",
+                "-draw", f"roundrectangle 0,0 {w - 1},{h - 1} {radius},{radius}", ")",
+                "-compose", "DstIn", "-composite",
+                "(", "+clone", "-background", "black", "-shadow", "45x18+0+14", ")",
+                "+swap", "-background", "none", "-compose", "Over", "-layers", "merge", "+repage",
+                str(work)])
+    sw, sh = image_size(work)
+    pad = max(48, round(max(w, h) * 0.07))
+    first, second = theme_colors()
+    run_magick(["-size", f"{sw + 2 * pad}x{sh + 2 * pad}", "-define", "gradient:angle=135",
+                f"gradient:{first}-{second}", str(work), "-gravity", "center",
+                "-compose", "Over", "-composite", str(out)])
+    work.unlink(missing_ok=True)
+    out.with_suffix(".small.png").unlink(missing_ok=True)
+    return out
+
+
+def ocr_text(path, work):
+    """Text in a screenshot. Upscaled 2x first: tesseract reads UI-sized text
+    far better at double size."""
+    big = work / f"{path.stem}-ocr.png"
+    run_magick([str(path), "-colorspace", "Gray", "-resize", "200%", str(big)])
+    out = subprocess.run(["tesseract", str(big), "-", "--psm", "3"],
+                         check=True, capture_output=True, text=True).stdout
+    return "\n".join(line.rstrip() for line in out.strip().splitlines())
+
+
+def qr_codes(path, work=None):
+    """QR/barcodes in a shot. Retries on a cleaned copy (white margin, grey,
+    hard threshold): a code touching the screen edge has no quiet zone."""
+    def scan(file):
+        run = subprocess.run(["zbarimg", "--quiet", "--raw", str(file)], capture_output=True, text=True)
+        return [line for line in run.stdout.splitlines() if line.strip()]
+    codes = scan(path)
+    if codes or work is None:
+        return codes
+    clean = work / f"{path.stem}-qr.png"
+    run_magick([str(path), "-bordercolor", "white", "-border", "60", "-colorspace", "Gray",
+                "-threshold", "55%", str(clean)])
+    return scan(clean)
+
+
+def launch(command):
+    """Start a helper (editor, pin, browser, notify) and reap it when it exits,
+    so a closed pin or editor doesn't linger as a zombie of the tray."""
+    proc = subprocess.Popen(command, start_new_session=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    threading.Thread(target=proc.wait, daemon=True).start()
+    return proc
 
 
 def read_inherited_capture(fd, pid):
@@ -247,6 +405,10 @@ button.remove:hover { color: #bed6d8; }
                      padding: 3px 10px; min-height: 0; }
 .sp-toggles button:checked { background-color: rgba(10, 220, 200, 0.08); border-color: rgba(10, 220, 200, 0.55); color: #0adcc8; }
 .dest { color: #546a70; font-size: 9pt; }
+.hoverbar { background-color: rgba(6, 8, 12, 0.88); border-radius: 6px; margin: 4px; padding: 1px 2px; }
+button.hb { min-width: 20px; min-height: 20px; padding: 0 3px; margin: 0; background: none; box-shadow: none;
+            border: none; color: #546a70; font-size: 10pt; }
+button.hb:hover { color: #0adcc8; }
 .status { color: #0adcc8; font-size: 9pt; }
 .status.error { color: #ff5c5c; }
 """
@@ -269,6 +431,7 @@ class Shotpile(Adw.Application):
         self.owning_clipboard = False
         self.clipboard = None
         self.first_capture = FIRST_CAPTURE
+        self.dragging = False
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -285,7 +448,8 @@ class Shotpile(Adw.Application):
         self.clipboard.connect("changed", self.on_clipboard_changed)
         # A key press while the tray is open arrives as one of these actions,
         # over D-Bus (see forward_to_open_tray), without a second GTK process.
-        for name, handler in (("shot", self.shoot), ("done", self.finish), ("close", self.close_tray)):
+        for name, handler in (("shot", self.shoot), ("scroll", lambda: self.shoot("scroll")),
+                              ("restore", self.restore), ("done", self.finish), ("close", self.close_tray)):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", lambda _action, _param, run=handler: run())
             self.add_action(action)
@@ -295,11 +459,20 @@ class Shotpile(Adw.Application):
         command = args[0] if args else "shot"
         if command == "shot":
             if self.first_capture and not self.capturing:
-                fd, pid = self.first_capture  # already picking: started before GTK loaded
+                fd, pid, started = self.first_capture  # already picking: started before GTK loaded
                 self.first_capture = None
-                self.await_capture(lambda: read_inherited_capture(fd, pid))
+                self.await_capture(lambda: read_inherited_capture(fd, pid), started)
             else:
                 self.shoot()
+        elif command == "scroll":
+            if self.first_capture and not self.capturing:
+                fd, pid, started = self.first_capture
+                self.first_capture = None
+                self.await_capture(lambda: read_inherited_capture(fd, pid), started)
+            else:
+                self.shoot("scroll")
+        elif command == "restore":
+            self.restore()
         elif command == "done":
             self.finish()
         elif command == "close":
@@ -312,47 +485,65 @@ class Shotpile(Adw.Application):
         if self.shots:
             self.open_panel()
 
+    def restore(self):
+        try:
+            saved = [Path(line) for line in LAST_PILE_FILE.read_text().splitlines() if line.strip()]
+        except OSError:
+            saved = []
+        saved = [p for p in saved if p.is_file() and p not in self.shots]
+        if not saved and not self.shots:
+            launch(["notify-send", "shotpile", "No closed pile to restore"])
+            return
+        self.shots = saved + self.shots
+        if self.dest_dir is None and self.shots:
+            self.dest_dir = self.shots[0].parent
+        self.show_tray(f"restored {len(saved)} shot{'s' if len(saved) != 1 else ''}")
+        self.stop_countdown()  # a restored pile waits for you
+
     # -- capture --------------------------------------------------------------
 
-    def shoot(self):
+    def shoot(self, mode=None):
         if self.capturing:
             # Like Omarchy's own screenshot key: pressing it again mid-pick cancels.
             subprocess.run(["pkill", "-x", "slurp"])
+            if shutil.which("omasnap"):
+                # Omasnap's documented toggle: a second instance dismisses the overlay.
+                subprocess.Popen(capture_command(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
         self.stop_countdown()
         if self.window and self.window.get_visible():
             self.window.set_visible(False)
             # A couple of frames for the compositor to drop the tray before the
             # screen freezes, or the tray ends up in the shot.
-            GLib.timeout_add(80, self.start_capture)
+            GLib.timeout_add(80, self.start_capture, mode)
         else:
-            self.start_capture()
+            self.start_capture(mode)
 
-    def start_capture(self):
+    def start_capture(self, mode=None):
+        started = time.time()
         try:
-            proc = subprocess.Popen(capture_command(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(capture_command(mode), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except OSError as error:
             self.show_tray(f"capture failed: {error.strerror}", error=True)
             return GLib.SOURCE_REMOVE
-        self.await_capture(lambda: proc.communicate()[0].decode(errors="replace"))
+        self.await_capture(lambda: proc.communicate()[0].decode(errors="replace"), started)
         return GLib.SOURCE_REMOVE
 
-    def await_capture(self, wait):
+    def await_capture(self, wait, started):
         """wait() blocks until the picker finishes and returns what it printed."""
         self.capturing = True
         self.hold()
 
         def run():
-            GLib.idle_add(self.on_captured, wait())
+            out = wait()
+            GLib.idle_add(self.on_captured, find_capture(out, started))
 
         threading.Thread(target=run, daemon=True).start()
 
-    def on_captured(self, out):
+    def on_captured(self, path):
         self.capturing = False
-        lines = [line.strip() for line in (out or "").splitlines() if line.strip()]
-        path = lines[-1] if lines else ""
-        if path and os.path.isfile(path):
-            self.shots.append(Path(path))
+        if path:
+            self.shots.append(path)
             # Same as a normal screenshot: the newest shot is on the clipboard.
             with open(path, "rb") as image:
                 subprocess.Popen(["wl-copy", "--type", "image/png"], stdin=image)
@@ -416,9 +607,11 @@ class Shotpile(Adw.Application):
 
         actions = Gtk.Box(spacing=8, halign=Gtk.Align.END)
         add = self.button("+ add another", lambda: self.shoot(), "or press super+shift+2")
+        scroll = self.button("+ scrolling", lambda: self.shoot("scroll"), "capture a scrolling page into the pile")
         self.done_button = self.button("done", self.toggle_panel)
         self.done_button.add_css_class("accent")  # the tray's one default action
         actions.append(add)
+        actions.append(scroll)
         actions.append(self.done_button)
 
         # Hidden, not collapsed: a collapsed panel would still set the tray's width.
@@ -549,10 +742,16 @@ class Shotpile(Adw.Application):
         picture = Gtk.Picture.new_for_paintable(texture)
         picture.set_content_fit(Gtk.ContentFit.COVER)
         picture.set_can_shrink(True)
-        picture.set_tooltip_text(f"{path.name}\nclick to edit")
+        picture.set_tooltip_text(f"{path.name}\nclick to edit • drag into any app")
         click = Gtk.GestureClick()
-        click.connect("released", lambda *_: self.edit(path))
+        click.connect("released", lambda *_: None if self.dragging else self.edit(path))
         picture.add_controller(click)
+        # CleanShot's signature move: drag the shot itself into Chrome, Slack, Files…
+        drag = Gtk.DragSource(actions=Gdk.DragAction.COPY)
+        drag.connect("prepare", lambda _src, _x, _y, p=path: self.drag_content(p))
+        drag.connect("drag-begin", lambda src, _drag, t=texture: self.on_drag_begin(src, t))
+        drag.connect("drag-end", lambda *_: self.on_drag_end())
+        picture.add_controller(drag)
 
         # A scrolled window that never scrolls: it sizes to its own request
         # instead of the picture's natural size, and clips the rounded corners.
@@ -576,7 +775,129 @@ class Shotpile(Adw.Application):
         remove.connect("clicked", lambda *_: self.drop(index))
         overlay.add_overlay(number)
         overlay.add_overlay(remove)
+        # Hover actions, like CleanShot's Quick Access card.
+        bar = Gtk.Box(spacing=0, halign=Gtk.Align.CENTER, valign=Gtk.Align.END)
+        bar.add_css_class("hoverbar")
+        for glyph, tip, handler in (
+                ("\uf0c5", "copy this shot (ctrl+c on the newest)", self.copy_one),
+                ("\uf040", "edit in omasnap", self.edit),
+                ("\uf08d", "pin on top of every workspace (p)", self.pin),
+                ("\uf031", "copy the text in it, OCR (t)", self.copy_text),
+                ("\uf029", "read a QR code in it", self.read_qr),
+                ("\uf0d0", "beautify: rounded, shadow, theme backdrop; replaces it in the pile", self.beautify_shot)):
+            hb = Gtk.Button(label=glyph, tooltip_text=tip)
+            hb.add_css_class("hb")
+            hb.connect("clicked", lambda *_a, h=handler, p=path: h(p))
+            bar.append(hb)
+        overlay.add_overlay(bar)
+        overlay.add_css_class("tile")
+        # Shown by pointer motion, not CSS :hover, which never fires on this
+        # layer-shell surface (measured live 2026-11-06).
+        bar.set_visible(False)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda *_a, b=bar: b.set_visible(True))
+        motion.connect("leave", lambda *_a, b=bar: b.set_visible(False))
+        overlay.add_controller(motion)
         return overlay
+
+    # -- per-shot actions -------------------------------------------------------
+
+    def drag_content(self, path):
+        gfile = Gio.File.new_for_path(str(path))
+        value = GObject.Value(Gdk.FileList, Gdk.FileList.new_from_list([gfile]))
+        providers = [
+            Gdk.ContentProvider.new_for_value(value),
+            Gdk.ContentProvider.new_for_bytes("text/uri-list", GLib.Bytes.new((gfile.get_uri() + "\r\n").encode())),
+            Gdk.ContentProvider.new_for_bytes("image/png", GLib.Bytes.new(path.read_bytes())),
+        ]
+        return Gdk.ContentProvider.new_union(providers)
+
+    def on_drag_begin(self, source, texture):
+        self.dragging = True
+        self.stop_countdown()  # don't vanish mid-drag
+        source.set_icon(texture, texture.get_width() // 2, texture.get_height() // 2)
+
+    def on_drag_end(self):
+        GLib.timeout_add(250, lambda: setattr(self, "dragging", False) or GLib.SOURCE_REMOVE)
+
+    def copy_one(self, path):
+        self.stop_countdown()
+        self.put_on_clipboard([path], path.read_bytes())
+        self.set_status(f"copied {path.name}")
+
+    def pin(self, path):
+        try:
+            launch(["omasnap", "--pin", str(path)])
+            self.set_status("pinned • close it from the pinned window")
+        except OSError as error:
+            self.set_status(f"couldn't pin: {error.strerror}", error=True)
+
+    def copy_text(self, path):
+        self.stop_countdown()
+        self.run_side_job("reading text…", lambda: ("text", ocr_text(path, self.work_dir())))
+
+    def read_qr(self, path):
+        self.stop_countdown()
+        self.run_side_job("looking for a QR code…", lambda: ("qr", qr_codes(path, self.work_dir())))
+
+    def beautify_shot(self, path):
+        self.stop_countdown()
+        out = unique_path(path.with_name(f"{path.stem}-pretty.png"))
+        self.run_side_job("beautifying…", lambda: ("pretty", path, beautify(path, out)))
+
+    def run_side_job(self, message, job):
+        """Per-shot work off the UI thread; shares the busy flag with pile jobs."""
+        if self.busy:
+            return
+        self.busy = True
+        self.set_status(message)
+
+        def worker():
+            try:
+                outcome = job()
+            except subprocess.CalledProcessError as error:
+                detail = (error.stderr or b"")
+                detail = detail.decode(errors="replace") if isinstance(detail, bytes) else detail
+                outcome = ("error", f"{error.cmd[0]} failed: {(detail.strip().splitlines() or [''])[-1]}")
+            except OSError as error:
+                outcome = ("error", f"{error.strerror}: {error.filename}")
+            GLib.idle_add(self.side_job_finished, outcome)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def side_job_finished(self, outcome):
+        self.busy = False
+        kind = outcome[0]
+        if kind == "error":
+            self.set_status(outcome[1], error=True)
+        elif kind == "text":
+            text = outcome[1]
+            if text:
+                self.put_text(text)
+                words = len(text.split())
+                self.set_status(f"copied {words} word{'s' if words != 1 else ''} of text")
+            else:
+                self.set_status("no text found", error=True)
+        elif kind == "qr":
+            codes = outcome[1]
+            if not codes:
+                self.set_status("no QR code found", error=True)
+            else:
+                self.put_text("\n".join(codes))
+                link = next((c for c in codes if c.startswith(("http://", "https://"))), None)
+                if link:
+                    launch(["xdg-open", link])
+                    self.set_status(f"opened + copied {link[:48]}")
+                else:
+                    self.set_status(f"copied QR: {codes[0][:48]}")
+        elif kind == "pretty":
+            _, original, pretty = outcome
+            if original in self.shots:
+                self.shots[self.shots.index(original)] = pretty
+            self.put_on_clipboard([pretty], pretty.read_bytes())
+            self.refresh()
+            self.set_status(f"beautified + copied • original kept as {original.name}")
+        return GLib.SOURCE_REMOVE
 
     def update_hint(self):
         if self.panel_open:
@@ -584,7 +905,7 @@ class Shotpile(Adw.Application):
         elif len(self.shots) == 1 and self.countdown_id:
             self.hint.set_label(f"saved • copied • super+shift+2 adds another • closes in {self.countdown}s")
         else:
-            self.hint.set_label("super+shift+2 adds another • done when you're finished")
+            self.hint.set_label("super+shift+2 adds another • hover a shot for actions, drag it anywhere")
 
     def drop(self, index):
         if 0 <= index < len(self.shots):
@@ -595,9 +916,13 @@ class Shotpile(Adw.Application):
             self.close_tray()
 
     def edit(self, path):
-        editor = os.environ.get("OMARCHY_SCREENSHOT_EDITOR", "tensaku-edit")
+        # Omasnap is Omarchy's editor since 4.5; an override that no longer
+        # exists (e.g. the old tensaku wrapper) falls through to it.
+        editor = os.environ.get("OMARCHY_SCREENSHOT_EDITOR") or ""
+        command = [editor, str(path)] if shutil.which(editor) and "tensaku" not in editor else ["omasnap", "--file", str(path)]
+        editor = command[0]
         try:
-            subprocess.Popen([editor, str(path)])
+            launch(command)
         except OSError as error:
             self.set_status(f"couldn't open {editor}: {error.strerror}", error=True)
 
@@ -621,6 +946,13 @@ class Shotpile(Adw.Application):
 
     def close_tray(self):
         self.stop_countdown()
+        if self.shots:
+            # CleanShot's "restore recently closed": `shotpile restore` brings it back.
+            try:
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                LAST_PILE_FILE.write_text("".join(f"{p}\n" for p in self.shots))
+            except OSError:
+                pass
         if self.window:
             self.window.destroy()
             self.window = None
@@ -640,6 +972,26 @@ class Shotpile(Adw.Application):
             return True
         if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and not self.panel_open:
             self.open_panel()
+            return True
+        newest = self.shots[-1] if self.shots else None
+        ctrl = bool(_state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(_state & Gdk.ModifierType.SHIFT_MASK)
+        if newest is None:
+            return False
+        if ctrl and keyval in (Gdk.KEY_c, Gdk.KEY_C):
+            if shift and len(self.shots) > 1:
+                self.run_job("copying…", self.job_copy_all)
+            else:
+                self.copy_one(newest)
+            return True
+        if keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
+            self.drop(len(self.shots) - 1)
+            return True
+        if not ctrl and keyval in (Gdk.KEY_p, Gdk.KEY_P):
+            self.pin(newest)
+            return True
+        if not ctrl and keyval in (Gdk.KEY_t, Gdk.KEY_T):
+            self.copy_text(newest)
             return True
         return False
 
@@ -765,6 +1117,16 @@ class Shotpile(Adw.Application):
             self.owning_clipboard = True
             self.hold()  # stay alive to serve the paste until something else is copied
 
+    def put_text(self, text):
+        data = GLib.Bytes.new(text.encode())
+        self.clipboard.set_content(Gdk.ContentProvider.new_union([
+            Gdk.ContentProvider.new_for_bytes("text/plain;charset=utf-8", data),
+            Gdk.ContentProvider.new_for_bytes("text/plain", data),
+            Gdk.ContentProvider.new_for_bytes("UTF8_STRING", data)]))
+        if not self.owning_clipboard:
+            self.owning_clipboard = True
+            self.hold()
+
     def on_clipboard_changed(self, clipboard):
         if self.owning_clipboard and not clipboard.get_property("local"):
             self.owning_clipboard = False
@@ -806,10 +1168,24 @@ class Shotpile(Adw.Application):
         if not self.window:
             return
         self.status.set_label(text)
-        if error:
-            self.status.add_css_class("error")
-        else:
-            self.status.remove_css_class("error")
+        for label in (self.status, self.hint):
+            if error:
+                label.add_css_class("error")
+            else:
+                label.remove_css_class("error")
+        if not self.panel_open:
+            # The panel's status line is hidden while the panel is closed, so
+            # per-shot actions report in the hint line for a few seconds.
+            self.hint.set_label(text)
+            self.hint.add_css_class("status")
+            GLib.timeout_add_seconds(4, self.reset_hint)
+
+    def reset_hint(self):
+        if self.window:
+            self.hint.remove_css_class("status")
+            self.hint.remove_css_class("error")
+            self.update_hint()
+        return GLib.SOURCE_REMOVE
 
 
 if __name__ == "__main__":
